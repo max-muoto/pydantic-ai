@@ -12,8 +12,15 @@ from typing_inspection.introspection import is_union_origin
 
 from . import _utils, messages as _messages
 from .exceptions import ModelRetry
-from .result import DEFAULT_OUTPUT_TOOL_NAME, OutputDataT, OutputDataT_inv, OutputValidatorFunc, ToolOutput
-from .tools import AgentDepsT, GenerateToolJsonSchema, RunContext, ToolDefinition
+from .result import (
+    DEFAULT_OUTPUT_TOOL_NAME,
+    OutputDataT,
+    OutputDataT_inv,
+    OutputValidatorFunc,
+    StructuredOutput,
+    ToolOutput,
+)
+from .tools import AgentDepsT, GenerateToolJsonSchema, ObjectJsonSchema, RunContext, ToolDefinition
 
 T = TypeVar('T')
 """An invariant TypeVar."""
@@ -83,13 +90,18 @@ class OutputSchema(Generic[OutputDataT]):
     Similar to `Tool` but for the final output of running an agent.
     """
 
+    # TODO: Since this is currently called "preferred", models that don't have structured output implemented yet ignore it and use tools (except for Mistral).
+    # We should likely raise an error if an unsupported mode is used, _and_ allow the model to pick its own preferred mode if none is forced.
+    preferred_mode: Literal['tool', 'structured'] | None  # TODO: Add mode for manual JSON
+    type_adapter: TypeAdapter[OutputDataT]
     tools: dict[str, OutputSchemaTool[OutputDataT]]
-    allow_text_output: bool
+    allow_text_output: bool  # TODO: Verify structured output works correctly with string as a union member
+    json_schema: ObjectJsonSchema  # TODO: Verify structured output works correctly with a union
 
     @classmethod
     def build(
         cls: type[OutputSchema[T]],
-        output_type: type[T] | ToolOutput[T],
+        output_type: type[T] | ToolOutput[T] | StructuredOutput[T],  # TODO: Support a list of output types/markers
         name: str | None = None,
         description: str | None = None,
         strict: bool | None = None,
@@ -98,15 +110,34 @@ class OutputSchema(Generic[OutputDataT]):
         if output_type is str:
             return None
 
+        preferred_mode = None
         if isinstance(output_type, ToolOutput):
             # do we need to error on conflicts here? (DavidM): If this is internal maybe doesn't matter, if public, use overloads
             name = output_type.name
             description = output_type.description
             output_type_ = output_type.output_type
             strict = output_type.strict
+            preferred_mode = 'tool'
+        elif isinstance(output_type, StructuredOutput):
+            name = output_type.name  # TODO: Get this to the response_format model request arg
+            description = output_type.description  # TODO: Get this to the response_format model request arg
+            output_type_ = output_type.output_type
+            strict = output_type.strict  # TODO: Get this to the response_format model request arg
+            preferred_mode = 'structured'
         else:
             output_type_ = output_type
 
+        type_adapter = cast(TypeAdapter[T], TypeAdapter(output_type_))
+        json_schema = _utils.check_object_json_schema(type_adapter.json_schema(schema_generator=GenerateToolJsonSchema))
+
+        # TODO: Make this description available to the model params
+        if json_schema_description := json_schema.pop('description', None):
+            if description is None:
+                description = json_schema_description
+            else:
+                description = f'{description}. {json_schema_description}'
+
+        # No need to include an output tool for string output
         if output_type_option := extract_str_from_union(output_type):
             output_type_ = output_type_option.value
             allow_text_output = True
@@ -134,7 +165,13 @@ class OutputSchema(Generic[OutputDataT]):
                 ),
             )
 
-        return cls(tools=tools, allow_text_output=allow_text_output)
+        return cls(
+            preferred_mode=preferred_mode,
+            tools=tools,
+            allow_text_output=allow_text_output,
+            type_adapter=type_adapter,
+            json_schema=json_schema,
+        )
 
     def find_named_tool(
         self, parts: Iterable[_messages.ModelResponsePart], tool_name: str
@@ -162,6 +199,35 @@ class OutputSchema(Generic[OutputDataT]):
     def tool_defs(self) -> list[ToolDefinition]:
         """Get tool definitions to register with the model."""
         return [t.tool_def for t in self.tools.values()]
+
+    def validate(
+        self, output_text: str, allow_partial: bool = False, wrap_validation_errors: bool = True
+    ) -> OutputDataT:
+        """Validate a structured output message.
+
+        Args:
+            output_text: The structured output from the LLM to validate.
+            allow_partial: If true, allow partial validation.
+            wrap_validation_errors: If true, wrap the validation errors in a retry message.
+
+        Returns:
+            Either the validated output data (left) or a retry message (right).
+        """
+        try:
+            pyd_allow_partial: Literal['off', 'trailing-strings'] = 'trailing-strings' if allow_partial else 'off'
+            output = self.type_adapter.validate_json(output_text, experimental_allow_partial=pyd_allow_partial)
+        except ValidationError as e:
+            if wrap_validation_errors:
+                m = _messages.RetryPromptPart(
+                    content=e.errors(include_url=False),
+                )
+                raise ToolRetryError(m) from e
+            else:
+                raise
+        else:
+            return output
+
+    # TODO: Build instructions for manual JSON
 
 
 DEFAULT_DESCRIPTION = 'The final response which ends this conversation'

@@ -21,6 +21,7 @@ from .._parts_manager import ModelResponsePartsManager
 from ..exceptions import UserError
 from ..messages import ModelMessage, ModelRequest, ModelResponse, ModelResponseStreamEvent
 from ..settings import ModelSettings
+from ..tools import ObjectJsonSchema  # TODO: Move to more generic place
 from ..usage import Usage
 
 if TYPE_CHECKING:
@@ -265,8 +266,11 @@ class ModelRequestParameters:
     """Configuration for an agent's request to a model, specifically related to tools and output handling."""
 
     function_tools: list[ToolDefinition]
-    allow_text_output: bool
+
+    preferred_output_mode: Literal['tool', 'structured'] | None
+    allow_text_output: bool  # TODO: How to handle with structured output?
     output_tools: list[ToolDefinition]
+    output_schema: ObjectJsonSchema | None
 
 
 class Model(ABC):

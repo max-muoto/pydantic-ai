@@ -28,6 +28,7 @@ from ..messages import (
     ModelResponsePart,
     ModelResponseStreamEvent,
     RetryPromptPart,
+    StructuredOutputPart,
     SystemPromptPart,
     TextPart,
     ToolCallPart,
@@ -163,6 +164,10 @@ class GeminiModel(Model):
             function_tools=[_customize_tool_def(tool) for tool in model_request_parameters.function_tools],
             allow_text_output=model_request_parameters.allow_text_output,
             output_tools=[_customize_tool_def(tool) for tool in model_request_parameters.output_tools],
+            output_schema=_GeminiJsonSchema(model_request_parameters.output_schema).walk()
+            if model_request_parameters.output_schema
+            else None,
+            preferred_output_mode=model_request_parameters.preferred_output_mode,
         )
 
     @property
@@ -523,7 +528,7 @@ def _content_model_response(m: ModelResponse) -> _GeminiContent:
     for item in m.parts:
         if isinstance(item, ToolCallPart):
             parts.append(_function_call_part_from_call(item))
-        elif isinstance(item, TextPart):
+        elif isinstance(item, (TextPart, StructuredOutputPart)):
             if item.content:
                 parts.append(_GeminiTextPart(text=item.content))
         else:

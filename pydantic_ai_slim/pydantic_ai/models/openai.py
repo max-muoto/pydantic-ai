@@ -26,6 +26,7 @@ from ..messages import (
     ModelResponsePart,
     ModelResponseStreamEvent,
     RetryPromptPart,
+    StructuredOutputPart,
     SystemPromptPart,
     TextPart,
     ToolCallPart,
@@ -197,7 +198,7 @@ class OpenAIModel(Model):
         response = await self._completions_create(
             messages, False, cast(OpenAIModelSettings, model_settings or {}), model_request_parameters
         )
-        return self._process_response(response), _map_usage(response)
+        return self._process_response(response, model_request_parameters), _map_usage(response)
 
     @asynccontextmanager
     async def request_stream(
@@ -251,15 +252,34 @@ class OpenAIModel(Model):
         model_settings: OpenAIModelSettings,
         model_request_parameters: ModelRequestParameters,
     ) -> chat.ChatCompletion | AsyncStream[ChatCompletionChunk]:
-        tools = self._get_tools(model_request_parameters)
+        tools = [self._map_tool_definition(r) for r in model_request_parameters.function_tools]
+        tool_choice: Literal['none', 'required', 'auto'] | None = None
+        response_format: chat.completion_create_params.ResponseFormat | NotGiven = NOT_GIVEN
 
-        # standalone function to make it easier to override
-        if not tools:
-            tool_choice: Literal['none', 'required', 'auto'] | None = None
-        elif not model_request_parameters.allow_text_output:
-            tool_choice = 'required'
+        if model_request_parameters.preferred_output_mode == 'structured' and (
+            output_schema := model_request_parameters.output_schema
+        ):
+            # TODO: Use ResponseFormatJSONObject on older models
+            response_format = chat.completion_create_params.ResponseFormatJSONSchema(  # pyright: ignore[reportPrivateImportUsage]
+                type='json_schema',
+                json_schema={
+                    'name': 'result',  # TODO: Take from StructuredOutput helper
+                    # 'description': result_tool.description,
+                    'schema': output_schema,
+                    'strict': False,  # TODO: Determine as we do for tools
+                },
+            )
+
+            if tools:
+                tool_choice = 'auto'
         else:
-            tool_choice = 'auto'
+            tools.extend(self._map_tool_definition(r) for r in model_request_parameters.output_tools)
+
+            if tools:
+                if not model_request_parameters.allow_text_output:
+                    tool_choice = 'required'
+                else:
+                    tool_choice = 'auto'
 
         openai_messages = await self._map_messages(messages)
 
@@ -278,6 +298,7 @@ class OpenAIModel(Model):
                 temperature=model_settings.get('temperature', NOT_GIVEN),
                 top_p=model_settings.get('top_p', NOT_GIVEN),
                 timeout=model_settings.get('timeout', NOT_GIVEN),
+                response_format=response_format,
                 seed=model_settings.get('seed', NOT_GIVEN),
                 presence_penalty=model_settings.get('presence_penalty', NOT_GIVEN),
                 frequency_penalty=model_settings.get('frequency_penalty', NOT_GIVEN),
@@ -292,13 +313,18 @@ class OpenAIModel(Model):
                 raise ModelHTTPError(status_code=status_code, model_name=self.model_name, body=e.body) from e
             raise
 
-    def _process_response(self, response: chat.ChatCompletion) -> ModelResponse:
+    def _process_response(
+        self, response: chat.ChatCompletion, model_request_parameters: ModelRequestParameters
+    ) -> ModelResponse:
         """Process a non-streamed response, and prepare a message to return."""
         timestamp = datetime.fromtimestamp(response.created, tz=timezone.utc)
         choice = response.choices[0]
         items: list[ModelResponsePart] = []
         if choice.message.content is not None:
-            items.append(TextPart(choice.message.content))
+            if model_request_parameters.preferred_output_mode == 'structured':
+                items.append(StructuredOutputPart(choice.message.content))
+            else:
+                items.append(TextPart(choice.message.content))
         if choice.message.tool_calls is not None:
             for c in choice.message.tool_calls:
                 items.append(ToolCallPart(c.function.name, c.function.arguments, tool_call_id=c.id))
@@ -334,7 +360,7 @@ class OpenAIModel(Model):
                 texts: list[str] = []
                 tool_calls: list[chat.ChatCompletionMessageToolCallParam] = []
                 for item in message.parts:
-                    if isinstance(item, TextPart):
+                    if isinstance(item, (TextPart, StructuredOutputPart)):
                         texts.append(item.content)
                     elif isinstance(item, ToolCallPart):
                         tool_calls.append(self._map_tool_call(item))
@@ -525,7 +551,7 @@ class OpenAIResponsesModel(Model):
         response = await self._responses_create(
             messages, False, cast(OpenAIResponsesModelSettings, model_settings or {}), model_request_parameters
         )
-        return self._process_response(response), _map_usage(response)
+        return self._process_response(response, model_request_parameters), _map_usage(response)
 
     @asynccontextmanager
     async def request_stream(
@@ -544,11 +570,17 @@ class OpenAIResponsesModel(Model):
     def customize_request_parameters(self, model_request_parameters: ModelRequestParameters) -> ModelRequestParameters:
         return _customize_request_parameters(model_request_parameters)
 
-    def _process_response(self, response: responses.Response) -> ModelResponse:
+    def _process_response(
+        self, response: responses.Response, model_request_parameters: ModelRequestParameters
+    ) -> ModelResponse:
         """Process a non-streamed response, and prepare a message to return."""
         timestamp = datetime.fromtimestamp(response.created_at, tz=timezone.utc)
         items: list[ModelResponsePart] = []
-        items.append(TextPart(response.output_text))
+        # TODO: Parse out manual JSON, a la split_content_into_text_and_thinking
+        if model_request_parameters.preferred_output_mode == 'structured':
+            items.append(StructuredOutputPart(response.output_text))
+        else:
+            items.append(TextPart(response.output_text))
         for item in response.output:
             if item.type == 'function_call':
                 items.append(ToolCallPart(item.name, item.arguments, tool_call_id=item.call_id))
@@ -610,6 +642,8 @@ class OpenAIResponsesModel(Model):
         reasoning = self._get_reasoning(model_settings)
 
         try:
+            # TODO: Pass text.format = ResponseFormatTextJSONSchemaConfigParam(...): {'type': 'json_schema', 'strict': True, 'name': '...', 'schema': ...}
+            # TODO: Fall back on ResponseFormatJSONObject/json_object on older models?
             return await self.client.responses.create(
                 input=openai_messages,
                 model=self._model_name,
@@ -696,7 +730,7 @@ class OpenAIResponsesModel(Model):
                         assert_never(part)
             elif isinstance(message, ModelResponse):
                 for item in message.parts:
-                    if isinstance(item, TextPart):
+                    if isinstance(item, (TextPart, StructuredOutputPart)):
                         openai_messages.append(responses.EasyInputMessageParam(role='assistant', content=item.content))
                     elif isinstance(item, ToolCallPart):
                         openai_messages.append(self._map_tool_call(item))
@@ -806,6 +840,7 @@ class OpenAIStreamedResponse(StreamedResponse):
             # Handle the text part of the response
             content = choice.delta.content
             if content is not None:
+                # TODO: Handle structured output
                 yield self._parts_manager.handle_text_delta(vendor_part_id='content', content=content)
 
             for dtc in choice.delta.tool_calls or []:
@@ -887,6 +922,7 @@ class OpenAIResponsesStreamedResponse(StreamedResponse):
                 pass
 
             elif isinstance(chunk, responses.ResponseTextDeltaEvent):
+                # TODO: Handle structured output
                 yield self._parts_manager.handle_text_delta(vendor_part_id=chunk.content_index, content=chunk.delta)
 
             elif isinstance(chunk, responses.ResponseTextDoneEvent):
@@ -1070,8 +1106,14 @@ def _customize_request_parameters(model_request_parameters: ModelRequestParamete
             t = replace(t, strict=schema_transformer.is_strict_compatible)
         return replace(t, parameters_json_schema=parameters_json_schema)
 
+    # TODO: Customize structured schema, add in strict
+
     return ModelRequestParameters(
         function_tools=[_customize_tool_def(tool) for tool in model_request_parameters.function_tools],
         allow_text_output=model_request_parameters.allow_text_output,
         output_tools=[_customize_tool_def(tool) for tool in model_request_parameters.output_tools],
+        output_schema=_OpenAIJsonSchema(model_request_parameters.output_schema, strict=None).walk()
+        if model_request_parameters.output_schema
+        else None,
+        preferred_output_mode=model_request_parameters.preferred_output_mode,
     )
